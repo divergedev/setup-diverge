@@ -1,0 +1,83 @@
+name: 'Setup Diverge'
+description: 'Install the Diverge CLI for preview environment management'
+branding:
+  icon: 'git-branch'
+  color: 'blue'
+
+inputs:
+  version:
+    description: 'Diverge CLI version to install (without v prefix). Defaults to latest.'
+    required: false
+    default: 'latest'
+  token:
+    description: 'GitHub token for API requests (avoids rate limits when resolving latest version).'
+    required: false
+    default: ${{ github.token }}
+
+outputs:
+  version:
+    description: 'The installed Diverge CLI version'
+    value: ${{ steps.install.outputs.version }}
+  cache-hit:
+    description: 'Whether the CLI was restored from cache'
+    value: ${{ steps.cache.outputs.cache-hit }}
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Resolve version
+      id: resolve
+      shell: bash
+      env:
+        INPUT_VERSION: ${{ inputs.version }}
+        GH_TOKEN: ${{ inputs.token }}
+      run: |
+        if [ "${INPUT_VERSION}" = "latest" ]; then
+          VERSION=$(gh api repos/divergedev/diverge/releases/latest --jq '.tag_name' | sed 's/^v//')
+          echo "Resolved latest version: ${VERSION}"
+        else
+          VERSION="${INPUT_VERSION}"
+        fi
+        echo "version=${VERSION}" >> $GITHUB_OUTPUT
+
+    - name: Cache Diverge CLI
+      id: cache
+      uses: actions/cache@v4
+      with:
+        path: ${{ runner.temp }}/diverge-bin
+        key: diverge-cli-${{ runner.os }}-${{ runner.arch }}-${{ steps.resolve.outputs.version }}
+
+    - name: Install Diverge CLI
+      id: install
+      if: steps.cache.outputs.cache-hit != 'true'
+      shell: bash
+      env:
+        VERSION: ${{ steps.resolve.outputs.version }}
+      run: |
+        mkdir -p "${{ runner.temp }}/diverge-bin"
+
+        # Map runner OS/arch to release artifact names
+        OS=$(echo "${{ runner.os }}" | tr '[:upper:]' '[:lower:]')
+        ARCH="${{ runner.arch }}"
+        case "${ARCH}" in
+          X64)   ARCH="amd64" ;;
+          ARM64) ARCH="arm64" ;;
+          *)     echo "::error::Unsupported architecture: ${ARCH}"; exit 1 ;;
+        esac
+
+        URL="https://github.com/divergedev/diverge/releases/download/v${VERSION}/diverge_${VERSION}_${OS}_${ARCH}.tar.gz"
+        echo "Downloading Diverge CLI v${VERSION} from ${URL}..."
+
+        curl -sSL "${URL}" | tar xz -C "${{ runner.temp }}/diverge-bin" diverge
+        chmod +x "${{ runner.temp }}/diverge-bin/diverge"
+
+        echo "version=${VERSION}" >> $GITHUB_OUTPUT
+        echo "✅ Diverge CLI v${VERSION} installed"
+
+    - name: Add to PATH
+      shell: bash
+      run: echo "${{ runner.temp }}/diverge-bin" >> $GITHUB_PATH
+
+    - name: Verify installation
+      shell: bash
+      run: diverge version
