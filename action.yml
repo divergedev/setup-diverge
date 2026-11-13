@@ -6,7 +6,7 @@ branding:
 
 inputs:
   version:
-    description: 'Diverge CLI version to install (without v prefix). Defaults to latest.'
+    description: 'Diverge CLI version to install (with or without v prefix). Defaults to latest.'
     required: false
     default: 'latest'
   token:
@@ -17,7 +17,7 @@ inputs:
 outputs:
   version:
     description: 'The installed Diverge CLI version'
-    value: ${{ steps.install.outputs.version }}
+    value: ${{ steps.resolve.outputs.version }}
   cache-hit:
     description: 'Whether the CLI was restored from cache'
     value: ${{ steps.cache.outputs.cache-hit }}
@@ -32,13 +32,18 @@ runs:
         INPUT_VERSION: ${{ inputs.version }}
         GH_TOKEN: ${{ inputs.token }}
       run: |
+        set -euo pipefail
         if [ "${INPUT_VERSION}" = "latest" ]; then
           VERSION=$(gh api repos/divergedev/diverge/releases/latest --jq '.tag_name' | sed 's/^v//')
           echo "Resolved latest version: ${VERSION}"
         else
-          VERSION="${INPUT_VERSION}"
+          VERSION="${INPUT_VERSION#v}"
         fi
-        echo "version=${VERSION}" >> $GITHUB_OUTPUT
+        if ! [[ "${VERSION}" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+          echo "::error::Invalid Diverge CLI version: '${VERSION}'"
+          exit 1
+        fi
+        echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
 
     - name: Cache Diverge CLI
       id: cache
@@ -53,30 +58,57 @@ runs:
       shell: bash
       env:
         VERSION: ${{ steps.resolve.outputs.version }}
+        TARGET_OS: ${{ runner.os }}
+        TARGET_ARCH: ${{ runner.arch }}
+        DEST_DIR: ${{ runner.temp }}/diverge-bin
       run: |
-        mkdir -p "${{ runner.temp }}/diverge-bin"
+        set -euo pipefail
+        mkdir -p "${DEST_DIR}"
 
         # Map runner OS/arch to release artifact names
-        OS=$(echo "${{ runner.os }}" | tr '[:upper:]' '[:lower:]')
-        ARCH="${{ runner.arch }}"
+        OS=$(echo "${TARGET_OS}" | tr '[:upper:]' '[:lower:]')
+        ARCH="${TARGET_ARCH}"
         case "${ARCH}" in
           X64)   ARCH="amd64" ;;
           ARM64) ARCH="arm64" ;;
           *)     echo "::error::Unsupported architecture: ${ARCH}"; exit 1 ;;
         esac
 
-        URL="https://github.com/divergedev/diverge/releases/download/v${VERSION}/diverge_${VERSION}_${OS}_${ARCH}.tar.gz"
-        echo "Downloading Diverge CLI v${VERSION} from ${URL}..."
+        TARBALL="diverge_${VERSION}_${OS}_${ARCH}.tar.gz"
+        BASE_URL="https://github.com/divergedev/diverge/releases/download/v${VERSION}"
+        TMP_DIR=$(mktemp -d)
+        trap 'rm -rf "${TMP_DIR}"' EXIT
 
-        curl -sSL "${URL}" | tar xz -C "${{ runner.temp }}/diverge-bin" diverge
-        chmod +x "${{ runner.temp }}/diverge-bin/diverge"
+        echo "Downloading Diverge CLI v${VERSION} from ${BASE_URL}/${TARBALL}..."
+        curl -fsSL "${BASE_URL}/${TARBALL}" -o "${TMP_DIR}/${TARBALL}"
+        curl -fsSL "${BASE_URL}/checksums.txt" -o "${TMP_DIR}/checksums.txt"
 
-        echo "version=${VERSION}" >> $GITHUB_OUTPUT
-        echo "✅ Diverge CLI v${VERSION} installed"
+        EXPECTED_LINE=$(awk -v f="${TARBALL}" '$2 == f { print; exit }' "${TMP_DIR}/checksums.txt")
+        if [ -z "${EXPECTED_LINE}" ]; then
+          echo "::error::Checksum entry not found for ${TARBALL} in checksums.txt"
+          exit 1
+        fi
+
+        (
+          cd "${TMP_DIR}"
+          if command -v sha256sum >/dev/null 2>&1; then
+            printf '%s\n' "${EXPECTED_LINE}" | sha256sum -c -
+          else
+            printf '%s\n' "${EXPECTED_LINE}" | shasum -a 256 -c -
+          fi
+        )
+
+        tar xzf "${TMP_DIR}/${TARBALL}" -C "${DEST_DIR}" diverge
+        chmod +x "${DEST_DIR}/diverge"
+
+        echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+        echo "✅ Diverge CLI v${VERSION} installed and verified"
 
     - name: Add to PATH
       shell: bash
-      run: echo "${{ runner.temp }}/diverge-bin" >> $GITHUB_PATH
+      env:
+        DEST_DIR: ${{ runner.temp }}/diverge-bin
+      run: echo "${DEST_DIR}" >> "$GITHUB_PATH"
 
     - name: Verify installation
       shell: bash
